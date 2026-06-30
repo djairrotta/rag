@@ -1,0 +1,139 @@
+name: seguramultas
+
+# Stack completa e autossuficiente do SEGURA MULTAS (tudo nosso): Postgres + Redis +
+# MinIO + api + worker + rag. Buildada dos Dockerfiles deste repo. Pensada para deploy
+# via EasyPanel (serviço Compose sourceado do GitHub) ou `docker compose up -d --build`.
+#
+# Segredos: defina no campo Environment do EasyPanel (ou num .env, no caminho local).
+# Os defaults 'troque-...' deixam subir, mas TROQUE antes de produção.
+
+x-app-env: &app-env
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: ${POSTGRES_DB:-seguramultas}
+  POSTGRES_USER: ${POSTGRES_USER:-seguramultas}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-troque-esta-senha}
+  REDIS_URL: redis://redis:6379/0
+  QUEUE_BACKEND: auto
+  JWT_SECRET: ${JWT_SECRET:-troque-este-segredo}
+  INTERNAL_SECRET: ${INTERNAL_SECRET:-troque-este-interno}
+  RAG_API_URL: http://rag:8000
+  RAG_API_KEY: ${RAG_API_KEY:-troque-este-rag}
+  ANALYZER_PROVIDER: ${ANALYZER_PROVIDER:-openai}
+  ANALYZER_MODEL: ${ANALYZER_MODEL:-gpt-4o-mini}
+  REQUIRE_PAYMENT: ${REQUIRE_PAYMENT:-false}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  MINIO_ENDPOINT: http://minio:9000
+  MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-seguramultas}
+  MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-troque-esta-minio}
+  BUCKET_FOTOS: fotos
+  BUCKET_RECURSOS: recursos
+  BUCKET_CONHECIMENTO: conhecimento
+  BUCKET_TIMBRADOS: timbrados
+  RAGFLOW_BASE_URL: ${RAGFLOW_BASE_URL:-}
+  RAGFLOW_API_KEY: ${RAGFLOW_API_KEY:-}
+  RAGFLOW_DATASET_NAME: ${RAGFLOW_DATASET_NAME:-seguramultas_mbft}
+
+volumes:
+  pg_data:
+  redis_data:
+  minio_data:
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-seguramultas}
+      POSTGRES_USER: ${POSTGRES_USER:-seguramultas}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-troque-esta-senha}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-seguramultas} -d ${POSTGRES_DB:-seguramultas}"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7.2-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "60", "1"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  minio:
+    image: quay.io/minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-seguramultas}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-troque-esta-minio}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9011:9001"     # console web do MinIO (opcional)
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio: { condition: service_started }
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-seguramultas}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-troque-esta-minio}
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD; do echo 'aguardando minio...'; sleep 2; done;
+      for b in fotos recursos conhecimento timbrados; do mc mb -p local/$$b; done;
+      echo 'buckets prontos'"
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    restart: unless-stopped
+    environment: *app-env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      minio: { condition: service_started }
+    ports:
+      - "8080:8000"     # teste no IP; ou aponte o domínio api.* p/ a porta 8000 deste serviço
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    restart: unless-stopped
+    command: ["python", "scripts/worker.py"]
+    environment: *app-env
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      api: { condition: service_healthy }
+
+  rag:
+    build:
+      context: .
+      dockerfile: Dockerfile.rag
+    restart: unless-stopped
+    environment:
+      RAG_API_KEY: ${RAG_API_KEY:-troque-este-rag}
+      RAGFLOW_BASE_URL: ${RAGFLOW_BASE_URL:-}
+      RAGFLOW_API_KEY: ${RAGFLOW_API_KEY:-}
+      RAGFLOW_DATASET_NAME: ${RAGFLOW_DATASET_NAME:-seguramultas_mbft}
+    expose:
+      - "8000"

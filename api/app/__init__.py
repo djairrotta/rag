@@ -1,0 +1,1 @@
+"""SEGURA MULTAS — API (FastAPI)."""

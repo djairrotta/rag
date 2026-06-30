@@ -1,0 +1,32 @@
+# REFERÊNCIA (documentação) — no EasyPanel cada serviço é um "app" e o domínio é
+# configurado pela UI. Use este arquivo como guia dos rótulos Traefik e portas.
+# Postgres, Qdrant e MinIO já existem na VPS (reaproveitados) e NÃO entram aqui.
+version: "3.8"
+services:
+  frontend:
+    build: ../frontend
+    labels:
+      - traefik.enable=true
+      - "traefik.http.routers.sm-front.rule=Host(`seguramultas.com.br`)"
+      - traefik.http.routers.sm-front.entrypoints=websecure
+      - traefik.http.routers.sm-front.tls.certresolver=le
+      - traefik.http.services.sm-front.loadbalancer.server.port=80
+
+  api:
+    build: ../api
+    env_file: ../.env
+    labels:
+      - traefik.enable=true
+      - "traefik.http.routers.sm-api.rule=Host(`api.seguramultas.com.br`)"
+      - traefik.http.routers.sm-api.entrypoints=websecure
+      - traefik.http.routers.sm-api.tls.certresolver=le
+      - traefik.http.services.sm-api.loadbalancer.server.port=8000
+
+  rag:
+    build: ../rag
+    env_file: ../.env
+    # INTERNO — sem Traefik. A api fala com a rag pela rede interna (http://rag:8000).
+    expose:
+      - "8000"
+
+# notebook (open-notebook) já roda na VPS, exposto em notebook.seguramultas.com.br.
