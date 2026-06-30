@@ -9,8 +9,10 @@ from __future__ import annotations
 import json
 
 import httpx
+from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.services import legal_search
 
 TITULO = "RECURSO ADMINISTRATIVO DE MULTA DE TRÂNSITO"
 
@@ -24,23 +26,69 @@ _SYS_REVIEW = (
 )
 
 
-def _rag_context(nullities: list[dict]) -> str:
-    """Busca fundamentos na base (best-effort). Silencioso se o RAG estiver indisponível."""
+def _semantica_nulidades(nullities: list[dict]) -> list[str]:
+    """Busca semântica no RAG a partir dos títulos das nulidades (best-effort)."""
     if not nullities:
-        return ""
+        return []
     consulta = " ".join(n.get("titulo", "") for n in nullities[:3]).strip()
     if not consulta:
-        return ""
+        return []
     try:
         headers = {"Authorization": f"Bearer {settings.rag_api_key}"} if settings.rag_api_key else {}
         r = httpx.post(f"{settings.rag_api_url}/search",
                        json={"consulta": consulta, "top_k": 5}, headers=headers, timeout=4)
         r.raise_for_status()
         results = r.json().get("results", [])
-        trechos = [x.get("texto", "") for x in results if x.get("texto")]
-        return "\n\n".join(trechos[:5])
+        # o rag devolve o texto em 'content' (e às vezes 'texto'); aceita os dois
+        return [x.get("texto") or x.get("content") or "" for x in results if (x.get("texto") or x.get("content"))]
     except Exception:
-        return ""
+        return []
+
+
+def _ficha_exata(db: Session | None, extracted: dict) -> list[str]:
+    """Busca DETERMINÍSTICA da ficha do MBFT pela infração autuada (código e/ou artigo).
+
+    É a peça que faltava: o gerador tinha o `codigo_infracao` em mãos mas só usava busca
+    semântica. Agora injeta a ficha EXATA (com 'Quando NÃO Autuar', amparo legal, gravidade)
+    — o material mais valioso para fundamentar o recurso. Sem `db`, degrada para vazio.
+    """
+    if db is None or not extracted:
+        return []
+    codigo = extracted.get("codigo_infracao")
+    artigo = extracted.get("ctb_article") or extracted.get("artigo")
+    if not codigo and not artigo:
+        return []
+    try:
+        ctx = legal_search.buscar_contexto_legal(
+            db,
+            codigos=[codigo] if codigo else None,
+            artigo=artigo,
+        )
+        return [f.get("texto", "") for f in ctx["fichas"] if f.get("texto")]
+    except Exception:
+        return []
+
+
+def _contexto_legal(db: Session | None, extracted: dict, nullities: list[dict]) -> str:
+    """Monta o contexto legal do recurso combinando, SEM prejuízo:
+      1. FICHA EXATA do MBFT (busca estruturada por código/artigo) — precisão;
+      2. fundamentos SEMÂNTICOS das nulidades (busca no RAG) — amplitude.
+    A ficha exata vem primeiro (é o esteio da tese de enquadramento/“Quando NÃO Autuar”).
+    """
+    blocos: list[str] = []
+    vistos: set[str] = set()
+
+    def _add(trechos: list[str]) -> None:
+        for t in trechos:
+            chave = (t or "")[:80]
+            if t and chave not in vistos:
+                vistos.add(chave)
+                blocos.append(t)
+
+    _add(_ficha_exata(db, extracted or {}))        # 1. exata (estruturada)
+    _add(_semantica_nulidades(nullities or []))    # 2. semântica (nulidades)
+
+    return "\n\n".join(blocos[:6])
 
 
 def _call_llm(system: str, user: str) -> str:
@@ -128,9 +176,15 @@ def _fallback_text(extracted: dict, nullities: list[dict], answers: dict, summar
     return "\n".join(L)
 
 
-def generate_text(*, extracted: dict, nullities: list[dict], answers: dict, summary: str) -> tuple[str, str]:
-    """Retorna (texto_final, engine)."""
-    rag = _rag_context(nullities or [])
+def generate_text(*, extracted: dict, nullities: list[dict], answers: dict, summary: str,
+                  db: Session | None = None) -> tuple[str, str]:
+    """Retorna (texto_final, engine).
+
+    `db` (opcional) habilita a injeção da FICHA EXATA do MBFT via busca estruturada
+    (código/artigo da infração). Sem `db`, cai apenas na busca semântica — comportamento
+    anterior preservado, nada quebra.
+    """
+    rag = _contexto_legal(db, extracted or {}, nullities or [])
     if _llm_available():
         try:
             draft = _call_llm(_SYS_DRAFT, _draft_prompt(extracted or {}, nullities or [], answers or {}, summary or "", rag))
