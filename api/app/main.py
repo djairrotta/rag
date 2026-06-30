@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.deps import get_db
 from app.core.errors import AppError, app_error_handler
-from app.routers import analyses, payments, recursos, auth, health, cases
+from app.routers import analyses, payments, recursos, auth, health, cases, legal
 
 app = FastAPI(
     title="SEGURA MULTAS · API",
@@ -36,6 +36,7 @@ app.include_router(cases.router)
 app.include_router(analyses.router)
 app.include_router(payments.router)
 app.include_router(recursos.router)
+app.include_router(legal.router)
 
 
 @app.get("/", tags=["meta"])
