@@ -51,7 +51,12 @@ class LegalSearchIn(BaseModel):
 
 
 def _semantic_search(consulta: str, codigo: str | None, top_k: int) -> list[dict]:
-    """Chama o serviço `rag` (RAGFlow) — busca semântica. Best-effort: lista vazia se cair."""
+    """Chama o serviço `rag` (RAGFlow) — busca semântica. Best-effort: lista vazia se cair.
+
+    Normaliza o shape ao da busca estruturada: o `rag` devolve o texto em `content` e o
+    artigo em `artigo_ctb`; aqui mapeamos para `texto`/`artigo` para que os dois lados
+    (estruturada + semântica) tenham o MESMO formato e o consumidor não precise ramificar.
+    """
     if not consulta or not consulta.strip():
         return []
     filtros = {"codigo": codigo} if codigo else None
@@ -65,8 +70,12 @@ def _semantic_search(consulta: str, codigo: str | None, top_k: int) -> list[dict
         )
         r.raise_for_status()
         results = r.json().get("results", [])
-        # marca a procedência para o consumidor distinguir das fichas exatas
         for x in results:
+            # unifica o nome dos campos com a busca estruturada
+            if "texto" not in x and x.get("content"):
+                x["texto"] = x["content"]
+            if "artigo" not in x and x.get("artigo_ctb"):
+                x["artigo"] = x["artigo_ctb"]
             x.setdefault("origem", "semantica")
         return results
     except Exception:
@@ -113,8 +122,13 @@ def legal_search_endpoint(body: LegalSearchIn, db: Session = Depends(get_db)) ->
     if not consulta and resultados:
         consulta = resultados[0].get("tipificacao") or resultados[0].get("texto", "")[:120]
 
-    codigo_filtro = (body.codigos or [None])[0]
-    semantica = _semantic_search(consulta or "", codigo_filtro, body.top_k)
+    # IMPORTANTE: a busca semântica NÃO filtra por código. Quando já temos a ficha exata
+    # pela estruturada, o objetivo da semântica é trazer teses RELACIONADAS (fichas de
+    # outros códigos, semanticamente próximas). Filtrar pelo mesmo código a tornaria
+    # redundante com a estruturada — e o RAGFlow lida mal com filtro de código exato.
+    # O filtro por código só faria sentido numa busca puramente semântica sem ficha exata;
+    # nesse caso o RAGFlow já recebe o código embutido na própria consulta textual.
+    semantica = _semantic_search(consulta or "", None, body.top_k)
     resultados.extend(semantica)
 
     # 3) combina + dedupe (estruturada já está na frente → prioridade no dedupe)
