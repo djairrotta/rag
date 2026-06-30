@@ -74,6 +74,7 @@ def generate(
     text, engine = recurso_gen.generate_text(
         extracted=analysis.campos or {}, nullities=analysis.nulidades or [],
         answers=analysis.questionario or {}, summary=veredito.get("summary", ""),
+        db=db,
     )
     docx_bytes = docx_render.render_docx(TITULO, text)
     owner = str(analysis.user_id or "anon")
