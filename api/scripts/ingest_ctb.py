@@ -2,22 +2,13 @@
 """CLI de ingestão do CTB consolidado (Planalto + Celso + 360 + Resolução 432).
 
 Casa a lei oficial (Planalto) com a doutrina (Celso) e os extras (360), por número de
-artigo, e inclui a Resolução CONTRAN 432/2013. Mesmo fluxo do MBFT.
+artigo, e inclui a Resolução CONTRAN 432/2013 (embutida no código). Baixa as fontes do
+Planalto (oficial) e do GitHub (api/data). Mesmo fluxo do MBFT.
 
-Exemplos:
-    # validar + relatório (não toca o banco):
-    python scripts/ingest_ctb.py \
-        --planalto /caminho/ctb_planalto.html \
-        --celso /caminho/Codigo-...-Celso.pdf \
-        --leg360 /caminho/CTB_-_2024.pdf \
-        --res432 /caminho/resolucao_432_2013.txt
-
-    # gravar no Postgres:
-    POSTGRES_HOST=... python scripts/ingest_ctb.py ... --write-db
-
-    # gravar e empurrar pro RAGFlow (dataset seguramultas_ctb):
-    POSTGRES_HOST=... RAGFLOW_BASE_URL=... RAGFLOW_API_KEY=... \
-        python scripts/ingest_ctb.py ... --write-db --push-ragflow
+    # validar (não toca o banco):
+    python scripts/ingest_ctb.py
+    # gravar no Postgres + indexar no RAGFlow (dataset seguramultas_ctb):
+    python scripts/ingest_ctb.py --write-db --push-ragflow
 """
 import argparse
 import glob
