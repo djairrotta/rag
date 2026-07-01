@@ -13,7 +13,7 @@ import httpx
 from app.core.config import settings
 
 _CODE_RE = re.compile(r"\b\d{3}-\d{2}\b")
-_dataset_id_cache: str | None = None
+_dataset_ids_cache: list[str] | None = None
 
 
 def enabled() -> bool:
@@ -35,19 +35,48 @@ def _unwrap(resp: httpx.Response) -> object:
     return body.get("data") if isinstance(body, dict) else body
 
 
-def _resolve_dataset_id(client: httpx.Client) -> str | None:
-    global _dataset_id_cache
+def _all_dataset_names() -> list[str]:
+    """Nome do dataset principal (MBFT) + extras (CTB etc.), sem duplicar, preservando ordem."""
+    nomes = [settings.ragflow_dataset_name]
+    for extra in (settings.ragflow_datasets_extra or "").split(","):
+        extra = extra.strip()
+        if extra and extra not in nomes:
+            nomes.append(extra)
+    return nomes
+
+
+def _resolve_dataset_ids(client: httpx.Client) -> list[str]:
+    """Resolve os ids de TODOS os datasets a consultar (principal + extras), com cache.
+
+    Se `ragflow_dataset_id` está fixado, ele entra como principal; os extras ainda são
+    resolvidos por nome. A busca semântica passa a cobrir MBFT + CTB numa única chamada.
+    """
+    global _dataset_ids_cache
+    if _dataset_ids_cache:
+        return _dataset_ids_cache
+
+    ids: list[str] = []
+    # dataset principal: id fixo tem prioridade; senão resolve por nome junto com os demais
     if settings.ragflow_dataset_id:
-        return settings.ragflow_dataset_id
-    if _dataset_id_cache:
-        return _dataset_id_cache
-    data = _unwrap(client.get("/datasets", params={"name": settings.ragflow_dataset_name})) or []
-    items = data if isinstance(data, list) else data.get("datasets") or []
-    for d in items:
-        if d.get("name") == settings.ragflow_dataset_name:
-            _dataset_id_cache = d["id"]
-            return _dataset_id_cache
-    return None
+        ids.append(settings.ragflow_dataset_id)
+        nomes = [n for n in _all_dataset_names() if n != settings.ragflow_dataset_name]
+    else:
+        nomes = _all_dataset_names()
+
+    for nome in nomes:
+        try:
+            data = _unwrap(client.get("/datasets", params={"name": nome})) or []
+            items = data if isinstance(data, list) else data.get("datasets") or []
+            for d in items:
+                if d.get("name") == nome and d.get("id") not in ids:
+                    ids.append(d["id"])
+                    break
+        except Exception:
+            continue  # um dataset ausente não derruba os demais
+
+    if ids:
+        _dataset_ids_cache = ids
+    return ids
 
 
 def _codigo_of(chunk: dict) -> str | None:
@@ -65,12 +94,12 @@ def search(consulta: str, filtros: dict | None, top_k: int) -> list[dict]:
     question = f"{consulta} {codigo}".strip() if codigo else consulta
 
     with _client() as client:
-        dataset_id = _resolve_dataset_id(client)
-        if not dataset_id:
+        dataset_ids = _resolve_dataset_ids(client)
+        if not dataset_ids:
             return []
         payload = {
             "question": question,
-            "dataset_ids": [dataset_id],
+            "dataset_ids": dataset_ids,
             "top_k": top_k,
             "page": 1,
             "page_size": top_k,
