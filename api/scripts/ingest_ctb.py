@@ -23,63 +23,66 @@ import argparse
 import glob
 import json
 import os
+import ssl
 import sys
+import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# pasta de dados versionada no repo (Forma A). Os arquivos foram enviados em api/data/.
+# pasta de dados local (fallback dev)
 _DATA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 
 _PLANALTO_URL = "https://www.planalto.gov.br/ccivil_03/leis/l9503compilado.htm"
 
+# Os arquivos-fonte estão versionados no repositório GitHub em api/data/.
+# O container os baixa via raw (comprovado acessível). Base do raw:
+_GH_RAW = "https://raw.githubusercontent.com/djairrotta/rag/main/api/data"
+_GH_CELSO = f"{_GH_RAW}/celso_comentado.pdf"
+_GH_360 = f"{_GH_RAW}/legislacao_360.pdf"
+_GH_PLANALTO = f"{_GH_RAW}/ctb_planalto.html"
 
-def _achar(*padroes: str) -> str | None:
-    """Acha o primeiro arquivo que casa com um dos padrões, procurando em api/data/
-    e subpastas. Robusto a variações de nome do upload."""
+
+def _ctx():
+    c = ssl.create_default_context()
+    c.check_hostname = False
+    c.verify_mode = ssl.CERT_NONE
+    return c
+
+
+def _baixar_url(url: str, destino: str, rotulo: str, minimo: int = 1000) -> str | None:
+    """Baixa uma URL para um arquivo local e devolve o caminho (ou None se falhar)."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        data = urllib.request.urlopen(req, timeout=40, context=_ctx()).read()
+        if len(data) < minimo:
+            print(f"[{rotulo}] download muito curto ({len(data)} bytes); ignorando.")
+            return None
+        open(destino, "wb").write(data)
+        print(f"[{rotulo}] baixado ({len(data)} bytes) de {url.split('/')[-1]}")
+        return destino
+    except Exception as e:
+        print(f"[{rotulo}] falha ao baixar: {type(e).__name__}: {str(e)[:100]}")
+        return None
+
+
+def _achar_local(*padroes: str) -> str | None:
     for pad in padroes:
-        # match direto
         p = os.path.join(_DATA, pad)
         if os.path.exists(p):
             return p
-        # match por glob (inclui subpastas como data/ctb/)
         for achado in glob.glob(os.path.join(_DATA, "**", pad), recursive=True):
             return achado
     return None
 
 
-def _baixar_planalto_atual(fallback_path: str | None) -> str | None:
-    """Baixa o CTB atual do Planalto; cai no HTML commitado se a rede falhar."""
-    try:
-        import ssl
-        import urllib.request
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        req = urllib.request.Request(_PLANALTO_URL, headers={"User-Agent": "Mozilla/5.0"})
-        html = urllib.request.urlopen(req, timeout=30, context=ctx).read()
-        if len(html) > 200_000 and b"253-A" in html:
-            destino = "/tmp/ctb_planalto_atual.html"
-            open(destino, "wb").write(html)
-            print(f"[planalto] baixado da fonte oficial ({len(html)} bytes).")
-            return destino
-        print("[planalto] download suspeito (curto/incompleto); usando HTML commitado.")
-    except Exception as e:
-        print(f"[planalto] falha no download ({type(e).__name__}); usando HTML commitado.")
-    return fallback_path
-
-
 def main() -> int:
     ap = argparse.ArgumentParser(description="Ingestão do CTB consolidado (lei + doutrina + resoluções).")
     ap.add_argument("--planalto", default=os.environ.get("CTB_PLANALTO_HTML"),
-                    help="Caminho do HTML do CTB (Planalto). Se omitido, procura em api/data/.")
+                    help="HTML do CTB. Se omitido: fonte oficial do Planalto; fallback GitHub.")
     ap.add_argument("--celso", default=os.environ.get("CTB_CELSO_PDF"),
-                    help="Caminho do PDF comentado (Celso). Se omitido, procura em api/data/.")
+                    help="PDF comentado (Celso). Se omitido: baixa do GitHub (api/data).")
     ap.add_argument("--leg360", default=os.environ.get("CTB_360_PDF"),
-                    help="Caminho do PDF Legislação 360. Se omitido, procura em api/data/.")
-    ap.add_argument("--res432", default=os.environ.get("CTB_RES432_TXT"),
-                    help="Caminho do TXT da Resolução 432/2013. Se omitido, procura em api/data/.")
-    ap.add_argument("--baixar-planalto", action="store_true",
-                    help="Baixa o CTB atual do Planalto na hora (fallback: HTML commitado).")
+                    help="PDF Legislação 360. Se omitido: baixa do GitHub (api/data).")
     ap.add_argument("--version", default="2024", help="version_label do documento (default 2024).")
     ap.add_argument("--dataset", default="seguramultas_ctb", help="nome do dataset no RAGFlow.")
     ap.add_argument("--write-db", action="store_true",
@@ -88,34 +91,40 @@ def main() -> int:
                     help="Empurra os chunks pro RAGFlow e grava os ids (requer --write-db + RAGFLOW_*).")
     args = ap.parse_args()
 
-    # auto-descoberta dos arquivos em api/data/ (tenta os nomes sugeridos E os originais)
+    # 1) PLANALTO — fonte oficial (mais atual); se falhar, versão do GitHub; depois local
     if not args.planalto:
-        args.planalto = _achar("ctb_planalto.html", "*planalto*.htm*", "l9503*.htm*", "*9503*.htm*")
+        args.planalto = (
+            _baixar_url(_PLANALTO_URL, "/tmp/ctb_planalto.html", "planalto", minimo=200_000)
+            or _baixar_url(_GH_PLANALTO, "/tmp/ctb_planalto.html", "planalto-gh", minimo=200_000)
+            or _achar_local("ctb_planalto.html", "*9503*.htm*")
+        )
+    # 2) CELSO — do GitHub; fallback local
     if not args.celso:
-        args.celso = _achar("celso_comentado.pdf", "*Celso*.pdf", "*comentado*.pdf", "*Martins*.pdf")
+        args.celso = (
+            _baixar_url(_GH_CELSO, "/tmp/celso_comentado.pdf", "celso", minimo=100_000)
+            or _achar_local("celso_comentado.pdf", "*Celso*.pdf", "*comentado*.pdf")
+        )
+    # 3) 360 — do GitHub; fallback local
     if not args.leg360:
-        args.leg360 = _achar("legislacao_360.pdf", "CTB_*.pdf", "*360*.pdf", "*2024*.pdf")
-    if not args.res432:
-        args.res432 = _achar("resolucao_432_2013.txt", "*432*.txt", "*resolucao*.txt")
+        args.leg360 = (
+            _baixar_url(_GH_360, "/tmp/legislacao_360.pdf", "leg360", minimo=100_000)
+            or _achar_local("legislacao_360.pdf", "CTB_*.pdf", "*360*.pdf")
+        )
 
-    if args.baixar_planalto:
-        args.planalto = _baixar_planalto_atual(args.planalto)
+    print("\n=== FONTES LOCALIZADAS ===")
+    for rot, cam in [("planalto", args.planalto), ("celso", args.celso), ("leg360", args.leg360)]:
+        print(f"  {rot}: {cam or '(ausente)'}")
+    print("  res432: embutida no código (ctb_consolidate)")
 
-    print("=== ARQUIVOS LOCALIZADOS ===")
-    for rot, cam in [("planalto", args.planalto), ("celso", args.celso),
-                     ("leg360", args.leg360), ("res432", args.res432)]:
-        print(f"  {rot}: {cam or '(não encontrado)'}")
-
-    if not any([args.planalto, args.celso, args.leg360, args.res432]):
-        ap.error("nenhuma fonte encontrada em api/data/ nem informada por argumento.")
-    for rotulo, caminho in [("planalto", args.planalto), ("celso", args.celso),
-                            ("leg360", args.leg360), ("res432", args.res432)]:
+    if not args.planalto and not args.celso and not args.leg360:
+        ap.error("nenhuma fonte de lei/doutrina disponível (Planalto, Celso ou 360).")
+    for rotulo, caminho in [("planalto", args.planalto), ("celso", args.celso), ("leg360", args.leg360)]:
         if caminho and not os.path.exists(caminho):
             ap.error(f"arquivo não encontrado ({rotulo}): {caminho}")
 
     # relatório de consolidação (sem tocar o banco)
     from app.services.ctb_consolidate import (  # noqa: E402
-        consolidar_ctb, parse_resolucao_432, relatorio,
+        consolidar_ctb, parse_resolucao_432_embutida, relatorio,
     )
     planalto_html = None
     if args.planalto:
@@ -123,8 +132,8 @@ def main() -> int:
     consolidados = consolidar_ctb(
         planalto_html=planalto_html, celso_pdf=args.celso, leg360_pdf=args.leg360,
     )
-    res432 = parse_resolucao_432(args.res432) if args.res432 else []
-    print("=== RELATÓRIO DA CONSOLIDAÇÃO ===")
+    res432 = parse_resolucao_432_embutida()   # texto embutido no código
+    print("\n=== RELATÓRIO DA CONSOLIDAÇÃO ===")
     print(json.dumps(relatorio(consolidados, res432), ensure_ascii=False, indent=2))
 
     if args.write_db:
@@ -137,7 +146,6 @@ def main() -> int:
                 planalto_html_path=args.planalto,
                 celso_pdf=args.celso,
                 leg360_pdf=args.leg360,
-                res432_txt=args.res432,
                 version_label=args.version,
                 dataset_name=args.dataset,
                 push_ragflow=args.push_ragflow,

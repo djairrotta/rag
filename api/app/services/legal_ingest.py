@@ -1,9 +1,12 @@
 """Ingestão de documentos jurídicos no Postgres (blueprint B3 / §6.7-6.8, §10.5).
 
-Cobre o MBFT (fichas via `mbft_splitter`) e o CTB consolidado (Planalto + doutrina +
-resoluções, via `ctb_consolidate`). Grava o documento em `legal_documents` e os chunks
-em `legal_document_chunks`, de forma idempotente (re-ingestão substitui os chunks do
-mesmo documento). O push para o RAGFlow preenche ragflow_dataset_id/document_id/chunk_id.
+Por enquanto cobre o MBFT (fichas via `mbft_splitter`). Grava o documento em
+`legal_documents` e os chunks (uma ficha = um chunk) em `legal_document_chunks`,
+de forma idempotente (re-ingestão substitui os chunks do mesmo documento).
+
+O push dos chunks para o RAGFlow (preenchendo ragflow_dataset_id/document_id/
+chunk_id) é o passo seguinte do B3 e exige uma instância RAGFlow — fica marcado
+como TODO; o registro Postgres já serve de fonte de verdade e índice.
 """
 from __future__ import annotations
 
@@ -181,7 +184,6 @@ def ingest_ctb(
     planalto_html_path: str | None = None,
     celso_pdf: str | None = None,
     leg360_pdf: str | None = None,
-    res432_txt: str | None = None,
     version_label: str = "2024",
     name: str = "Código de Trânsito Brasileiro — consolidado (lei + doutrina + resoluções)",
     dataset_name: str = "seguramultas_ctb",
@@ -195,7 +197,7 @@ def ingest_ctb(
     """
     from app.services.ctb_consolidate import (
         consolidar_ctb,
-        parse_resolucao_432,
+        parse_resolucao_432_embutida,
         relatorio as ctb_relatorio,
     )
 
@@ -206,7 +208,7 @@ def ingest_ctb(
     consolidados = consolidar_ctb(
         planalto_html=planalto_html, celso_pdf=celso_pdf, leg360_pdf=leg360_pdf,
     )
-    res432 = parse_resolucao_432(res432_txt) if res432_txt else []
+    res432 = parse_resolucao_432_embutida()
 
     # monta chunk_dicts no formato esperado por replace_chunks
     chunk_dicts: list[dict] = []
