@@ -108,10 +108,12 @@ class Settings(BaseSettings):
     storage_dir: str = "/tmp/sm-storage"       # fallback local (dev/teste) quando sem MinIO
 
     # Regras de negócio server-side (não vêm do .env)
-    b2c_price_percent: float = 0.20
-    b2c_price_cap_brl: float = 300.0
-    b2c_price_fallback_brl: float = 69.90
-    partner_credit_multiplier: int = 3
+    b2c_price_percent: float = 0.20            # B2C: 20% do valor da multa
+    b2c_price_cap_brl: float = 300.0           # teto do preço B2C
+    b2c_price_fallback_brl: float = 69.90      # sem valor legível na multa
+    b2c_drunk_price_brl: float = 249.90        # embriaguez (CTB 165/165-A): preço diferenciado
+    partner_price_per_recurso_brl: float = 250.0  # B2B: R$250 fixo por recurso gerado
+    partner_credit_multiplier: int = 3         # (legado)
 
     def provider_config(self, name: str) -> dict:
         """Retorna {dialect, base_url, api_key, model, vision_model} de um provider.
