@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     ragflow_api_key: str = ""
     ragflow_dataset_name: str = "seguramultas_mbft"
     ragflow_dataset_id: str = ""            # opcional: fixa o dataset e evita lookup por nome
+    # Datasets adicionais consultados JUNTO com o principal na busca semântica.
+    # CSV de nomes (ex.: "seguramultas_ctb"). O /search passa a devolver MBFT + CTB.
+    ragflow_datasets_extra: str = "seguramultas_ctb"
 
     # Fonte da ingestão em produção (MinIO). Opcional — ingestão também aceita docs locais.
     minio_endpoint: str = ""
