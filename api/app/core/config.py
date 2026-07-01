@@ -45,15 +45,50 @@ class Settings(BaseSettings):
     queue_backend: str = "auto"
     queue_name: str = "sm:jobs"
 
-    # LLM (admin escolhe modelo por tarefa; M4 usa o analyzer_model p/ visão+nulidades)
-    anthropic_api_key: str = ""
+    # ---------------------------------------------------------------- LLM
+    # Multi-provider com fallback. O admin escolhe o provider ativo por dropdown
+    # na dashboard (grava em analyzer_provider). Cada provider tem base_url + key
+    # no .env da stack. Groq é o fallback universal quando o principal falha.
+    #
+    # Providers diretos suportados: openai | anthropic | deepseek | kimi
+    # Fallback: groq (compatível-OpenAI, cobre vários modelos)
+    analyzer_provider: str = "openai"          # provider ativo (dropdown do admin)
+
+    # OpenAI (compatível-OpenAI)
     openai_api_key: str = ""
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_model: str = "gpt-4o-mini"          # texto (nulidades)
+    openai_vision_model: str = "gpt-4o-mini"   # visão (validar/extrair)
+
+    # Anthropic (API própria — dialeto diferente)
+    anthropic_api_key: str = ""
+    anthropic_base_url: str = "https://api.anthropic.com/v1"
+    anthropic_model: str = "claude-sonnet-4-6"
+    anthropic_vision_model: str = "claude-sonnet-4-6"
+
+    # DeepSeek (compatível-OpenAI)
     deepseek_api_key: str = ""
+    deepseek_base_url: str = "https://api.deepseek.com/v1"
+    deepseek_model: str = "deepseek-chat"
+    deepseek_vision_model: str = "deepseek-chat"
+
+    # Kimi / Moonshot (compatível-OpenAI)
+    kimi_api_key: str = ""
+    kimi_base_url: str = "https://api.moonshot.cn/v1"
+    kimi_model: str = "moonshot-v1-32k"
+    kimi_vision_model: str = "moonshot-v1-32k-vision-preview"
+
+    # Groq — FALLBACK universal (compatível-OpenAI)
+    groq_api_key: str = ""
+    groq_base_url: str = "https://api.groq.com/openai/v1"
+    groq_model: str = "llama-3.3-70b-versatile"
+    groq_vision_model: str = "llama-3.2-90b-vision-preview"
+
+    # (legado — mantidos p/ não quebrar .env antigos; não usados no novo analyzer)
     glm_api_key: str = ""
     minimax_api_key: str = ""
-    kimi_api_key: str = ""
-    analyzer_provider: str = "openai"          # openai | anthropic (fallback se sem chave)
-    analyzer_model: str = "gpt-4o-mini"        # modelo de visão p/ validar/extrair/analisar
+    analyzer_model: str = "gpt-4o-mini"        # legado; use *_model por provider
+
     require_payment: bool = False              # paywall: True = recurso só após pagamento
 
     # Asaas (pagamentos)
@@ -77,6 +112,50 @@ class Settings(BaseSettings):
     b2c_price_cap_brl: float = 300.0
     b2c_price_fallback_brl: float = 69.90
     partner_credit_multiplier: int = 3
+
+    def provider_config(self, name: str) -> dict:
+        """Retorna {dialect, base_url, api_key, model, vision_model} de um provider.
+
+        dialect: 'openai' (compatível-OpenAI) ou 'anthropic' (API própria).
+        Providers vazios (sem api_key) são detectáveis por api_key == ''.
+        """
+        p = name.lower()
+        if p == "anthropic":
+            return {
+                "dialect": "anthropic",
+                "base_url": self.anthropic_base_url,
+                "api_key": self.anthropic_api_key,
+                "model": self.anthropic_model,
+                "vision_model": self.anthropic_vision_model,
+            }
+        table = {
+            "openai": (self.openai_base_url, self.openai_api_key, self.openai_model, self.openai_vision_model),
+            "deepseek": (self.deepseek_base_url, self.deepseek_api_key, self.deepseek_model, self.deepseek_vision_model),
+            "kimi": (self.kimi_base_url, self.kimi_api_key, self.kimi_model, self.kimi_vision_model),
+            "groq": (self.groq_base_url, self.groq_api_key, self.groq_model, self.groq_vision_model),
+        }
+        base_url, api_key, model, vision_model = table.get(p, table["openai"])
+        return {
+            "dialect": "openai",
+            "base_url": base_url,
+            "api_key": api_key,
+            "model": model,
+            "vision_model": vision_model,
+        }
+
+    def provider_chain(self) -> list[str]:
+        """Ordem de tentativa: provider ativo primeiro, Groq como fallback final.
+
+        Só inclui providers COM api_key configurada. Groq entra por último se tiver
+        chave e não for já o ativo. Se nada tiver chave, devolve [] (analyzer usa fallback determinístico).
+        """
+        chain: list[str] = []
+        active = (self.analyzer_provider or "openai").lower()
+        if self.provider_config(active)["api_key"]:
+            chain.append(active)
+        if self.groq_api_key and active != "groq":
+            chain.append("groq")
+        return chain
 
     @property
     def database_url(self) -> str:
