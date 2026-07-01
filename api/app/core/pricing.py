@@ -1,10 +1,15 @@
-"""Regras de preço B2C — porte fiel de supabase/functions/_shared/pricing.ts.
+"""Regras de preço do Segura Multas (server-side; o cliente NUNCA calcula preço).
 
+B2C (cliente final):
 - Preço do recurso = 20% do valor da multa, teto R$300.
 - Sem valor legível => fallback R$69,90.
-- Embriaguez (CTB 165 e 165-A) => CONTACT_REQUIRED (não cobra/gera automático).
+- Embriaguez (CTB 165 e 165-A) => analisada normalmente, mas com PREÇO diferenciado
+  (b2c_drunk_price_brl) e AVISO próprio. NÃO é mais CONTACT_REQUIRED.
 
-O cliente NUNCA calcula preço — é sempre server-side (princípio nº 5 do blueprint).
+B2B (parceiro):
+- R$250 FIXO por recurso gerado (partner_price_per_recurso_brl). Sem faixa, sem %, sem mensalidade.
+
+Todos os valores vêm de settings (config.py) e serão editáveis pelo admin na dashboard (Fase 5).
 """
 from __future__ import annotations
 
@@ -22,12 +27,12 @@ DRUNK_KEYWORDS = (
 
 @dataclass
 class PriceDecision:
-    kind: str                       # "PRICE" | "CONTACT_REQUIRED"
+    kind: str                       # "PRICE" (sempre, agora) — mantido p/ compat.
     amount: float | None = None
-    source: str | None = None       # "percentage" | "fallback"
+    source: str | None = None       # "percentage" | "fallback" | "drunk" | "partner_flat"
     fine_value: float | None = None
-    reason: str | None = None       # "DRUNK_DRIVING"
-    message: str | None = None
+    reason: str | None = None       # "DRUNK_DRIVING" (informativo)
+    message: str | None = None      # aviso ao cliente (embriaguez tem aviso próprio)
 
 
 def parse_fine_value(raw) -> float | None:
@@ -70,14 +75,23 @@ def is_drunk_driving(extracted: dict | None) -> bool:
 
 
 def decide_price(extracted: dict | None) -> PriceDecision:
+    """Preço B2C (cliente final). SEMPRE retorna PRICE (nunca mais CONTACT_REQUIRED).
+
+    - Embriaguez (CTB 165/165-A): analisada normalmente, mas com PREÇO diferenciado
+      (settings.b2c_drunk_price_brl) e um AVISO próprio. Não manda mais pro WhatsApp.
+    - Demais: 20% da multa (teto R$300); sem valor legível → fallback R$69,90.
+    """
     if is_drunk_driving(extracted):
         return PriceDecision(
-            kind="CONTACT_REQUIRED",
+            kind="PRICE",
+            amount=round(settings.b2c_drunk_price_brl, 2),
+            source="drunk",
+            fine_value=parse_fine_value((extracted or {}).get("valor_multa")),
             reason="DRUNK_DRIVING",
             message=(
-                "Casos de embriaguez (CTB art. 165 e 165-A) exigem atendimento "
-                "especializado. Entre em contato pelo WhatsApp ou e-mail para "
-                "avaliarmos o seu caso."
+                "Este é um caso de embriaguez ao volante (CTB art. 165/165-A), matéria de "
+                "maior complexidade. A análise é feita normalmente, com valor diferenciado, "
+                "e recomendamos acompanhamento jurídico especializado para o recurso."
             ),
         )
     fine_value = parse_fine_value((extracted or {}).get("valor_multa"))
@@ -85,3 +99,20 @@ def decide_price(extracted: dict | None) -> PriceDecision:
         return PriceDecision(kind="PRICE", amount=settings.b2c_price_fallback_brl, source="fallback", fine_value=None)
     capped = min(fine_value * settings.b2c_price_percent, settings.b2c_price_cap_brl)
     return PriceDecision(kind="PRICE", amount=round(capped, 2), source="percentage", fine_value=round(fine_value, 2))
+
+
+def decide_partner_price(extracted: dict | None = None) -> PriceDecision:
+    """Preço B2B (parceiro): R$250 FIXO por recurso gerado. Sem faixa, sem %, sem mensalidade.
+
+    Recebe `extracted` só por simetria de assinatura (não é usado no cálculo, mas permite
+    aviso de embriaguez se o parceiro quiser exibir). O valor vem de settings (editável pelo admin).
+    """
+    msg = None
+    if is_drunk_driving(extracted):
+        msg = "Caso de embriaguez (CTB 165/165-A) — matéria complexa; recomendável revisão do recurso."
+    return PriceDecision(
+        kind="PRICE",
+        amount=round(settings.partner_price_per_recurso_brl, 2),
+        source="partner_flat",
+        message=msg,
+    )
