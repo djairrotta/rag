@@ -1,12 +1,9 @@
 """Ingestão de documentos jurídicos no Postgres (blueprint B3 / §6.7-6.8, §10.5).
 
-Por enquanto cobre o MBFT (fichas via `mbft_splitter`). Grava o documento em
-`legal_documents` e os chunks (uma ficha = um chunk) em `legal_document_chunks`,
-de forma idempotente (re-ingestão substitui os chunks do mesmo documento).
-
-O push dos chunks para o RAGFlow (preenchendo ragflow_dataset_id/document_id/
-chunk_id) é o passo seguinte do B3 e exige uma instância RAGFlow — fica marcado
-como TODO; o registro Postgres já serve de fonte de verdade e índice.
+Cobre o MBFT (fichas via `mbft_splitter`) e o CTB consolidado (Planalto + doutrina +
+resoluções, via `ctb_consolidate`). Grava o documento em `legal_documents` e os chunks
+em `legal_document_chunks`, de forma idempotente (re-ingestão substitui os chunks do
+mesmo documento). O push para o RAGFlow preenche ragflow_dataset_id/document_id/chunk_id.
 """
 from __future__ import annotations
 
@@ -169,6 +166,148 @@ def push_mbft_to_ragflow(db: Session, *, version_label: str = "2022", client=Non
 
     return {
         "dataset_name": settings.ragflow_dataset_name,
+        "dataset_id": dataset_id,
+        "document_id": rf_doc_id,
+        "chunks_pushed": pushed,
+    }
+
+
+# =========================================================================== #
+# Ingestão do CTB consolidado (Planalto + Celso + 360 + Resolução 432)
+# =========================================================================== #
+def ingest_ctb(
+    db: Session,
+    *,
+    planalto_html_path: str | None = None,
+    celso_pdf: str | None = None,
+    leg360_pdf: str | None = None,
+    res432_txt: str | None = None,
+    version_label: str = "2024",
+    name: str = "Código de Trânsito Brasileiro — consolidado (lei + doutrina + resoluções)",
+    dataset_name: str = "seguramultas_ctb",
+    push_ragflow: bool = False,
+) -> dict:
+    """Pipeline de ingestão do CTB consolidado no Postgres (+ RAGFlow opcional).
+
+    Casa Planalto (lei oficial) + Celso (doutrina) + 360 (extras) por artigo, e inclui
+    a Resolução 432/2013. Grava em legal_documents/legal_document_chunks de forma
+    idempotente (document_type='ctb').
+    """
+    from app.services.ctb_consolidate import (
+        consolidar_ctb,
+        parse_resolucao_432,
+        relatorio as ctb_relatorio,
+    )
+
+    planalto_html = None
+    if planalto_html_path:
+        planalto_html = open(planalto_html_path, "rb").read().decode("latin-1", errors="ignore")
+
+    consolidados = consolidar_ctb(
+        planalto_html=planalto_html, celso_pdf=celso_pdf, leg360_pdf=leg360_pdf,
+    )
+    res432 = parse_resolucao_432(res432_txt) if res432_txt else []
+
+    # monta chunk_dicts no formato esperado por replace_chunks
+    chunk_dicts: list[dict] = []
+    idx = 0
+    for c in consolidados + res432:
+        chunk_dicts.append({
+            "chunk_index": idx,
+            "title": c["article"],
+            "section": c["metadata"].get("source", "ctb"),
+            "article": c["article"],
+            "content": c["content"],
+            "metadata": c["metadata"],
+        })
+        idx += 1
+
+    doc = upsert_legal_document(
+        db, name=name, document_type="ctb", version_label=version_label,
+        source_url="https://www.planalto.gov.br/ccivil_03/leis/l9503compilado.htm",
+    )
+    n = replace_chunks(db, doc, chunk_dicts)
+    db.commit()
+
+    report = ctb_relatorio(consolidados, res432)
+    report["legal_document_id"] = str(doc.id)
+    report["chunks_gravados"] = n
+
+    if push_ragflow:
+        report["ragflow"] = push_ctb_to_ragflow(db, version_label=version_label, dataset_name=dataset_name)
+    else:
+        report["ragflow_push"] = "desabilitado (use --push-ragflow)"
+    return report
+
+
+def push_ctb_to_ragflow(
+    db: Session, *, version_label: str = "2024",
+    dataset_name: str = "seguramultas_ctb", client=None,
+) -> dict:
+    """Empurra os chunks do CTB (já no Postgres) para o RAGFlow dataset `seguramultas_ctb`.
+
+    Mesmo padrão do MBFT: acha/cria o dataset, recria um documento limpo, insere cada
+    artigo como chunk (com art_numero, resoluções e fonte como keywords) e grava os ids.
+    """
+    from app.services.ragflow_client import RagflowClient
+
+    doc = db.execute(
+        select(LegalDocument).where(
+            LegalDocument.document_type == "ctb",
+            LegalDocument.version_label == version_label,
+        )
+    ).scalars().first()
+    if doc is None:
+        raise RuntimeError("CTB ainda não está no Postgres — rode ingest_ctb primeiro.")
+
+    rows = db.execute(
+        select(LegalDocumentChunk)
+        .where(LegalDocumentChunk.legal_document_id == doc.id)
+        .order_by(LegalDocumentChunk.chunk_index)
+    ).scalars().all()
+    if not rows:
+        raise RuntimeError("nenhum chunk do CTB no Postgres para empurrar.")
+
+    owns_client = client is None
+    client = client or RagflowClient()
+    try:
+        dataset_id = client.find_or_create_dataset(
+            dataset_name,
+            embedding_model=settings.ragflow_embed_model,
+            chunk_method="naive",
+        )
+        doc_name = f"CTB {version_label}.txt"
+        provenance = (
+            f"Código de Trânsito Brasileiro consolidado {version_label} — lei oficial "
+            f"(Planalto) + doutrina (Celso Luiz Martins, 2012) + Resolução CONTRAN 432/2013. "
+            f"{len(rows)} chunks, ingestão via pipeline do SEGURA MULTAS."
+        ).encode("utf-8")
+        rf_doc_id = client.ensure_clean_document(dataset_id, doc_name, provenance)
+
+        pushed = 0
+        for i, row in enumerate(rows, start=1):
+            meta = row.chunk_metadata or {}
+            # keywords: artigo + números das resoluções citadas + fonte
+            kws = [meta.get("art_numero"), row.article]
+            for r in (meta.get("resolucoes_citadas") or []):
+                kws.append(f"Res{r.get('numero')}")
+            if meta.get("resolucao"):
+                kws.append(f"Res{meta['resolucao']}")
+            keywords = [k for k in kws if k]
+            chunk_id = client.add_chunk(dataset_id, rf_doc_id, row.content, keywords)
+            row.ragflow_dataset_id = dataset_id
+            row.ragflow_document_id = rf_doc_id
+            row.ragflow_chunk_id = chunk_id
+            pushed += 1
+            if i % 50 == 0:
+                db.commit()
+        db.commit()
+    finally:
+        if owns_client:
+            client.close()
+
+    return {
+        "dataset_name": dataset_name,
         "dataset_id": dataset_id,
         "document_id": rf_doc_id,
         "chunks_pushed": pushed,
