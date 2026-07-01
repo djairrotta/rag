@@ -23,7 +23,12 @@ router = APIRouter(prefix="/analyses", tags=["analyses"])
 
 
 def _verdict_payload(verdict: dict) -> dict:
-    return {"summary": verdict.get("summary"), "recommendation": verdict.get("recommendation")}
+    return {
+        "summary": verdict.get("summary"),
+        "recommendation": verdict.get("recommendation"),
+        "por_frente": verdict.get("por_frente"),
+        "grounded": verdict.get("grounded", False),
+    }
 
 
 @router.post("")
@@ -101,14 +106,71 @@ async def create_analysis(
         "status": status,
         "extracted_data": extracted,
         "nullities": verdict.get("nullities", []),
+        "por_frente": verdict.get("por_frente"),
         "summary": verdict.get("summary"),
         "recommendation": verdict.get("recommendation"),
+        "grounded": verdict.get("grounded", False),
         "engine": analyzer.provider_label(),
     }
 
 
+@router.get("")
+def list_analyses(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[dict]:
+    """Lista as analises do usuario logado (mais recentes primeiro) — alimenta o painel.
+
+    Retorna um resumo por analise: campos extraidos, status, veredito (com por_frente),
+    nulidades e se o recurso ja esta disponivel.
+    """
+    rows = (
+        db.query(Analysis)
+        .filter(Analysis.user_id == user.id)
+        .order_by(Analysis.created_at.desc())
+        .limit(100)
+        .all()
+    )
+    out: list[dict] = []
+    for an in rows:
+        veredito = an.veredito or {}
+        out.append({
+            "analysis_id": str(an.id),
+            "status": an.status,
+            "extracted_data": an.campos or {},
+            "nullities": an.nulidades or [],
+            "por_frente": veredito.get("por_frente"),
+            "summary": veredito.get("summary"),
+            "recommendation": veredito.get("recommendation"),
+            "resource_available": an.resource_available,
+            "created_at": an.created_at.isoformat() if an.created_at else None,
+        })
+    return out
+
+
 class ClaimIn(BaseModel):
     claim_token: str
+
+
+@router.post("/extract")
+async def extract_fields(file: UploadFile = File(...)):
+    """Extracao LEVE: valida + le os 12 campos (passos 0 e 1), sem as 3 frentes.
+
+    Usado pelo frontend para escolher o questionario dinamico ANTES da analise
+    completa. Rapido e barato (nao roda nulidade/merito/entendimento).
+    """
+    data = await file.read()
+    if not data:
+        return JSONResponse(status_code=400, content={"rejected": True, "error": "Arquivo é obrigatório"})
+
+    mime = file.content_type or "image/jpeg"
+    image_b64 = base64.b64encode(data).decode("ascii")
+
+    validation = analyzer.validate_document(image_b64, mime, len(data))
+    if not validation["is_traffic_fine"]:
+        return JSONResponse(status_code=200, content={
+            "rejected": True,
+            "validation": validation,
+        })
+    extracted = analyzer.extract_data(image_b64, mime)
+    return {"rejected": False, "extracted": extracted, "engine": analyzer.provider_label()}
 
 
 @router.post("/{analysis_id}/claim")
